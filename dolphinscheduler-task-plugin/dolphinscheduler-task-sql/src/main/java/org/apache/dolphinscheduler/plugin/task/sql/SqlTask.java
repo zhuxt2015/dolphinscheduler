@@ -23,7 +23,6 @@ import org.apache.dolphinscheduler.plugin.datasource.api.utils.DataSourceUtils;
 import org.apache.dolphinscheduler.plugin.task.api.AbstractTaskExecutor;
 import org.apache.dolphinscheduler.plugin.task.api.SQLTaskExecutionContext;
 import org.apache.dolphinscheduler.plugin.task.api.TaskConstants;
-import org.apache.dolphinscheduler.plugin.task.api.TaskException;
 import org.apache.dolphinscheduler.plugin.task.api.TaskExecutionContext;
 import org.apache.dolphinscheduler.plugin.task.api.enums.Direct;
 import org.apache.dolphinscheduler.plugin.task.api.enums.SqlType;
@@ -43,7 +42,6 @@ import org.apache.dolphinscheduler.spi.utils.StringUtils;
 import org.apache.commons.collections4.CollectionUtils;
 
 import java.sql.Connection;
-import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
@@ -54,8 +52,6 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 import org.slf4j.Logger;
@@ -137,20 +133,20 @@ public class SqlTask extends AbstractTaskExecutor {
                     sqlTaskExecutionContext.getConnectionParams());
 
             // ready to execute SQL and parameter entity Map
-            List<SqlBinds> mainStatementSqlBinds = SqlSplitter.split(sqlParameters.getSql(), sqlParameters.getSegmentSeparator())
+            List<String> mainStatementSqlBinds = SqlSplitter.split(sqlParameters.getSql(), sqlParameters.getSegmentSeparator())
                     .stream()
-                    .map(this::getSqlAndSqlParamsMap)
+                    .map(this::parseSql)
                     .collect(Collectors.toList());
 
-            List<SqlBinds> preStatementSqlBinds = Optional.ofNullable(sqlParameters.getPreStatements())
+            List<String> preStatementSqlBinds = Optional.ofNullable(sqlParameters.getPreStatements())
                     .orElse(new ArrayList<>())
                     .stream()
-                    .map(this::getSqlAndSqlParamsMap)
+                    .map(this::parseSql)
                     .collect(Collectors.toList());
-            List<SqlBinds> postStatementSqlBinds = Optional.ofNullable(sqlParameters.getPostStatements())
+            List<String> postStatementSqlBinds = Optional.ofNullable(sqlParameters.getPostStatements())
                     .orElse(new ArrayList<>())
                     .stream()
-                    .map(this::getSqlAndSqlParamsMap)
+                    .map(this::parseSql)
                     .collect(Collectors.toList());
 
             List<String> createFuncs = createFuncs(sqlTaskExecutionContext.getUdfFuncParametersList(), logger);
@@ -168,16 +164,26 @@ public class SqlTask extends AbstractTaskExecutor {
     }
 
     /**
+     * replace placeholder with parameter
+     * @param sql
+     * @return parsed sql
+     */
+    private String parseSql(String sql) {
+        Map<String, Property> paramsMap = taskExecutionContext.getPrepareParamsMap();
+        return ParameterUtils.convertParameterPlaceholders(sql, ParamUtils.convert(paramsMap));
+    }
+
+    /**
      * execute function and sql
      *
-     * @param mainStatementsBinds main statements binds
-     * @param preStatementsBinds pre statements binds
-     * @param postStatementsBinds post statements binds
+     * @param mainStatements main statements
+     * @param preStatements pre statements
+     * @param postStatements post statements
      * @param createFuncs create functions
      */
-    public void executeFuncAndSql(List<SqlBinds> mainStatementsBinds,
-                                  List<SqlBinds> preStatementsBinds,
-                                  List<SqlBinds> postStatementsBinds,
+    public void executeFuncAndSql(List<String> mainStatements,
+                                  List<String> preStatements,
+                                  List<String> postStatements,
                                   List<String> createFuncs) throws Exception {
         Connection connection = null;
         try {
@@ -190,24 +196,24 @@ public class SqlTask extends AbstractTaskExecutor {
             }
 
             // pre execute
-            executeUpdate(connection, preStatementsBinds, "pre");
+            executeUpdate(connection, preStatements, "pre");
 
             // main execute
             String result = null;
             // decide whether to executeQuery or executeUpdate based on sqlType
             if (sqlParameters.getSqlType() == SqlType.QUERY.ordinal()) {
                 // query statements need to be convert to JsonArray and inserted into Alert to send
-                result = executeQuery(connection, mainStatementsBinds.get(0), "main");
+                result = executeQuery(connection, mainStatements.get(0));
             } else if (sqlParameters.getSqlType() == SqlType.NON_QUERY.ordinal()) {
                 // non query statement
-                String updateResult = executeUpdate(connection, mainStatementsBinds, "main");
+                String updateResult = executeUpdate(connection, mainStatements, "main");
                 result = setNonQuerySqlReturn(updateResult, sqlParameters.getLocalParams());
             }
             //deal out params
             sqlParameters.dealOutParam(result);
 
             // post execute
-            executeUpdate(connection, postStatementsBinds, "post");
+            executeUpdate(connection, postStatements, "post");
         } catch (Exception e) {
             logger.error("execute sql error: {}", e.getMessage());
             throw e;
@@ -291,20 +297,35 @@ public class SqlTask extends AbstractTaskExecutor {
         setTaskAlertInfo(taskAlertInfo);
     }
 
-    private String executeQuery(Connection connection, SqlBinds sqlBinds, String handlerType) throws Exception {
-        try (PreparedStatement statement = prepareStatementAndBind(connection, sqlBinds)) {
-            logger.info("{} statement execute query, for sql: {}", handlerType, sqlBinds.getSql());
-            ResultSet resultSet = statement.executeQuery();
+    private String executeQuery(Connection connection, String sql) throws Exception {
+        boolean timeoutFlag = taskExecutionContext.getTaskTimeoutStrategy() == TaskTimeoutStrategy.FAILED
+                || taskExecutionContext.getTaskTimeoutStrategy() == TaskTimeoutStrategy.WARNFAILED;
+        Statement statement = null;
+        ResultSet resultSet = null;
+        try {
+            statement = connection.createStatement();
+            if (timeoutFlag) {
+                statement.setQueryTimeout(taskExecutionContext.getTaskTimeout());
+            }
+            resultSet = statement.executeQuery(sql);
+            logger.info("main statement execute query, for sql: {}", sql);
             return resultProcess(resultSet);
+        }finally {
+            if (resultSet != null) {
+                resultSet.close();
+            }
+            if (statement != null) {
+                statement.close();
+            }
         }
     }
 
-    private String executeUpdate(Connection connection, List<SqlBinds> statementsBinds, String handlerType) throws Exception {
+    private String executeUpdate(Connection connection, List<String> sqls, String handlerType) throws SQLException {
         int result = 0;
-        for (SqlBinds sqlBind : statementsBinds) {
-            try (PreparedStatement statement = prepareStatementAndBind(connection, sqlBind)) {
-                result = statement.executeUpdate();
-                logger.info("{} statement execute update result: {}, for sql: {}", handlerType, result, sqlBind.getSql());
+        for (String sql : sqls) {
+            try (Statement statement = connection.createStatement()) {
+                result = statement.executeUpdate(sql);
+                logger.info("{} statement execute update result: {}, for sql: {}", handlerType, result, sql);
             }
         }
         return String.valueOf(result);
@@ -339,116 +360,6 @@ public class SqlTask extends AbstractTaskExecutor {
                 logger.error("close connection error : {}", e.getMessage(), e);
             }
         }
-    }
-
-    /**
-     * preparedStatement bind
-     *
-     * @param connection connection
-     * @param sqlBinds sqlBinds
-     * @return PreparedStatement
-     * @throws Exception Exception
-     */
-    private PreparedStatement prepareStatementAndBind(Connection connection, SqlBinds sqlBinds) {
-        // is the timeout set
-        boolean timeoutFlag = taskExecutionContext.getTaskTimeoutStrategy() == TaskTimeoutStrategy.FAILED
-                || taskExecutionContext.getTaskTimeoutStrategy() == TaskTimeoutStrategy.WARNFAILED;
-        try {
-            PreparedStatement stmt = connection.prepareStatement(sqlBinds.getSql());
-            if (timeoutFlag) {
-                stmt.setQueryTimeout(taskExecutionContext.getTaskTimeout());
-            }
-            Map<Integer, Property> params = sqlBinds.getParamsMap();
-            if (params != null) {
-                for (Map.Entry<Integer, Property> entry : params.entrySet()) {
-                    Property prop = entry.getValue();
-                    ParameterUtils.setInParameter(entry.getKey(), stmt, prop.getType(), prop.getValue());
-                }
-            }
-            logger.info("prepare statement replace sql : {} ", stmt);
-            return stmt;
-        } catch (Exception exception) {
-            throw new TaskException("SQL task prepareStatementAndBind error", exception);
-        }
-    }
-
-    /**
-     * print replace sql
-     *
-     * @param content content
-     * @param formatSql format sql
-     * @param rgex rgex
-     * @param sqlParamsMap sql params map
-     */
-    private void printReplacedSql(String content, String formatSql, String rgex, Map<Integer, Property> sqlParamsMap) {
-        //parameter print style
-        logger.info("after replace sql , preparing : {}", formatSql);
-        StringBuilder logPrint = new StringBuilder("replaced sql , parameters:");
-        if (sqlParamsMap == null) {
-            logger.info("printReplacedSql: sqlParamsMap is null.");
-        } else {
-            for (int i = 1; i <= sqlParamsMap.size(); i++) {
-                logPrint.append(sqlParamsMap.get(i).getValue()).append("(").append(sqlParamsMap.get(i).getType()).append(")");
-            }
-        }
-        logger.info("Sql Params are {}", logPrint);
-    }
-
-    /**
-     * ready to execute SQL and parameter entity Map
-     *
-     * @return SqlBinds
-     */
-    private SqlBinds getSqlAndSqlParamsMap(String sql) {
-        Map<Integer, Property> sqlParamsMap = new HashMap<>();
-        StringBuilder sqlBuilder = new StringBuilder();
-
-        // combining local and global parameters
-        Map<String, Property> paramsMap = taskExecutionContext.getPrepareParamsMap();
-
-        // spell SQL according to the final user-defined variable
-        if (paramsMap == null) {
-            sqlBuilder.append(sql);
-            return new SqlBinds(sqlBuilder.toString(), sqlParamsMap);
-        }
-
-        if (StringUtils.isNotEmpty(sqlParameters.getTitle())) {
-            String title = ParameterUtils.convertParameterPlaceholders(sqlParameters.getTitle(),
-                    ParamUtils.convert(paramsMap));
-            logger.info("SQL title : {}", title);
-            sqlParameters.setTitle(title);
-        }
-
-        //new
-        //replace variable TIME with $[YYYYmmddd...] in sql when history run job and batch complement job
-        sql = ParameterUtils.replaceScheduleTime(sql, taskExecutionContext.getScheduleTime());
-        // special characters need to be escaped, ${} needs to be escaped
-        setSqlParamsMap(sql, rgex, sqlParamsMap, paramsMap,taskExecutionContext.getTaskInstanceId());
-        //Replace the original value in sql ！{...} ，Does not participate in precompilation
-        String rgexo = "['\"]*\\!\\{(.*?)\\}['\"]*";
-        sql = replaceOriginalValue(sql, rgexo, paramsMap);
-        // replace the ${} of the SQL statement with the Placeholder
-        String formatSql = sql.replaceAll(rgex, "?");
-        // Convert the list parameter
-        formatSql = ParameterUtils.expandListParameter(sqlParamsMap, formatSql);
-        sqlBuilder.append(formatSql);
-        // print replace sql
-        printReplacedSql(sql, formatSql, rgex, sqlParamsMap);
-        return new SqlBinds(sqlBuilder.toString(), sqlParamsMap);
-    }
-
-    private String replaceOriginalValue(String content, String rgex, Map<String, Property> sqlParamsMap) {
-        Pattern pattern = Pattern.compile(rgex);
-        while (true) {
-            Matcher m = pattern.matcher(content);
-            if (!m.find()) {
-                break;
-            }
-            String paramName = m.group(1);
-            String paramValue = sqlParamsMap.get(paramName).getValue();
-            content = m.replaceFirst(paramValue);
-        }
-        return content;
     }
 
     /**
